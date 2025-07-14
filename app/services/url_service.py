@@ -123,8 +123,16 @@ class URLPhishingDetector:
             return 1   # Phishing (long)
     def Shortining_Service(self, url: str) -> int:
         """Check if URL uses shortening service"""
-        shortening_services = r"(bit\.ly|goo\.gl|tinyurl\.com|ow\.ly|is\.gd|t\.co|short\.link|tiny\.cc)"
-        return 1 if re.search(shortening_services, url) else -1
+        from urllib.parse import urlparse
+        
+        shortening_services = {
+            'bit.ly', 'goo.gl', 'tinyurl.com', 'ow.ly', 
+            'is.gd', 't.co', 'short.link', 'tiny.cc'
+        }
+        
+        domain = urlparse(url).netloc.lower()
+        return 1 if domain in shortening_services else -1
+
     def having_At_Symbol(self, url: str) -> int:
         """Check for @ symbol in URL"""
         return 1 if "@" in url else -1
@@ -767,17 +775,6 @@ class URLPhishingDetector:
             features_array = np.array(features).reshape(1, -1)
             prediction = self.model.predict(features_array)
             is_phishing = bool(prediction[0])
-            
-            # Override prediction if all trust indicators are positive
-            whois_valid = 'error' not in raw_details.get('whois', {})
-            ssl_valid = not isinstance(raw_details.get('ssl_cert'), str)  # ssl_cert is dict if valid, string if error
-            dns_valid = raw_details.get('dns_record', False)
-            vt_clean = raw_details.get('virustotal_report', '').lower() == 'clean'
-            phishtank_clean = raw_details.get('phishtank_reported', '').lower() == 'no'
-
-            if whois_valid and ssl_valid and dns_valid and vt_clean and phishtank_clean:
-                is_phishing = False
-
 
             feature_names = [
                 'having_IP_Address', 'URL_Length', 'Shortining_Service',
@@ -788,6 +785,24 @@ class URLPhishingDetector:
                 'favicon', 'iframe', 'sfh', 'redirect'
             ]
             features_dict = {name: value for name, value in zip(feature_names, features)}
+            
+            # Override prediction if all trust indicators are positive
+            whois_valid = 'error' not in raw_details.get('whois', {})
+            ssl_valid = not isinstance(raw_details.get('ssl_cert'), str) and features_dict['SSLfinal_State'] == 1
+            dns_valid = raw_details.get('dns_record', False)
+            vt_clean = raw_details.get('virustotal_report', '').lower() == 'clean'
+            phishtank_clean = raw_details.get('phishtank_reported', '').lower() == 'no'
+
+            # # Check SSL state and web traffic - if both are suspicious/bad, mark as phishing
+            ssl_state = features_dict['SSLfinal_State']
+            web_traffic_state = features_dict['web_traffic']
+            if (ssl_state in [-1, 0]) and (web_traffic_state in [-1, 0]):
+                is_phishing = True
+
+            if whois_valid and ssl_valid and dns_valid and vt_clean and phishtank_clean:
+                is_phishing = False
+            
+           
             feature_explanations = self.get_feature_explanations(features_dict)
             return {
                 'is_phishing': is_phishing,

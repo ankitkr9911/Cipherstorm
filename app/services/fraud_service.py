@@ -462,16 +462,28 @@ def run_fraud_pipeline(transaction_obj, profile_obj, txn_count: int, last_transa
     layer2_result = layer2_heuristics_check(transaction_obj, profile_obj)
 
     # --- LAYER 3: Rule-based Local Model Prediction ---
-    # First encode the transaction features for Layer 3
-    encoded_features = encode_local_features(transaction_obj)
     
-    # Create a transaction object with encoded features for Layer 3
-    transaction_with_encoded = type('obj', (object,), {
-        **{k: v for k, v in transaction_obj.__dict__.items() if not k.startswith('_')},
-        **encoded_features
-    })()
-    
-    layer3_result = rule_based_layer3_predict(transaction_with_encoded, user_stats, distance_from_last)
+     # Only apply Layer 3 after 10 transactions
+    if txn_count > 10:
+        # First encode the transaction features for Layer 3
+        encoded_features = encode_local_features(transaction_obj)
+        
+        # Create a transaction object with encoded features for Layer 3
+        transaction_with_encoded = type('obj', (object,), {
+            **transaction_obj.__dict__,
+            **encoded_features
+        })()
+        
+        layer3_result = rule_based_layer3_predict(transaction_with_encoded, user_stats, distance_from_last)
+    else:
+        # For first 10 transactions, return empty Layer 3 result
+        layer3_result = {
+            'is_anomaly': 0,
+            'rules_triggered': [],
+            'confidence': 0.0,
+            'total_weight': 0.0,
+            'encoded_features': {}
+        }
 
     # --- Final Decision Fusion ---
     # Combine all layers

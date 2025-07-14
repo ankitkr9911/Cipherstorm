@@ -42,7 +42,7 @@ PHONE_REGEX = re.compile(
     r'(?:\(?\d{2,5}\)?[\s\-]?)?'  # Optional area code
     r'\d{3,4}[\s\-]?\d{4,5}'  # Main number
     r'|'
-    r'1800[\s\-]?\d{3,4}[\s\-]?\d{3,4}'  # Toll-free numbers
+    r'1800[\s\-]?\d{2,4}(?:[\s\-]?\d{2,4})?'  # Toll-free numbers
     r'|'
     r'18\d{2}[\s\-]?\d{3,4}[\s\-]?\d{3,4}'  # Other toll-free variations
     r')'
@@ -64,8 +64,12 @@ def extract_phone_numbers(text: str) -> List[str]:
     
     for match in matches:
         cleaned = match.strip()
+
+        digits_only = re.sub(r'[^\d]', '', cleaned)
+        is_toll_free = digits_only.startswith(('1800', '18'))
         
-        if len(re.sub(r'[^\d]', '', cleaned)) >= 10 and cleaned not in seen:
+        if ((is_toll_free and len(digits_only) >= 7) or 
+        (not is_toll_free and len(digits_only) >= 10)) and cleaned not in seen:
             cleaned_numbers.append(cleaned)
             seen.add(cleaned)
     
@@ -153,14 +157,14 @@ def get_llm_strategy(phone_list: List[str]) -> str:
         "Extract ALL legitimate customer service phone numbers from website content.\n"
         f"Phone numbers found: {phone_list}\n"
         "Include ALL numbers that could be customer service related:\n"
-        "- Must be 10+ digits long\n"
+        "- Must be 10+ digits long (or 7+ digits for toll-free numbers like 1800-XXXX)\n"
         "- Toll-free numbers (1800, 800, etc.)\n"
         "- Numbers labeled as 'customer care', 'support', 'helpline', 'contact', 'partnership', 'legal'\n"
         "- Numbers under city/location names (these are regional customer service)\n"
         "- Numbers under department names (legal, partnership, etc.)\n"
         "- Numbers from company contact pages or customer service pages\n"
         "EXCLUDE ONLY:\n"
-        "- Numbers with less than 10 digits\n"
+        "-Numbers with less than 10 digits (except toll-free numbers which can be 7+ digits)\n"
         "- Numbers that are clearly dates, IDs, or codes (like 2024, 1234, etc.)\n"
         "When in doubt, INCLUDE the number. Return ALL valid customer service numbers."
     )
@@ -268,7 +272,9 @@ def filter_customer_care_numbers(chunks: List[str], phone_relation: dict, max_re
     
     for number in filtered:
         normalized = normalize_phone_number(number)
-        if len(normalized) >= 10 and normalized not in seen_normalized:
+        is_toll_free = normalized.startswith('1800')
+        if ((is_toll_free and len(normalized) >= 7) or  # Allow toll-free numbers ≥ 7 digits
+            (not is_toll_free and len(normalized) >= 10)) and normalized not in seen_normalized:
             seen_normalized.add(normalized)
             unique_filtered.append(number)
     
@@ -365,7 +371,7 @@ def get_company_numbers_internal(company_name: str) -> List[str]:
     query = f"{company_name} customer care number india customer care"
     logger.info(f"Searching Google for: {query}")
     
-    urls = google_search(query, num_results=15)  # Reduced from 30 to avoid rate limits
+    urls = google_search(query, num_results=10)  # Reduced to process only first 10 URLs
     logger.info(f"Found {len(urls)} URLs to process")
     
     for i, url in enumerate(urls):
@@ -404,18 +410,20 @@ def analyze_phone_number(phone_number: str) -> dict:
     """Analyze phone number type and characteristics"""
     cleaned = normalize_phone_number(phone_number)
     
-    # Handle Indian numbers with country code
-    if cleaned.startswith('91') and len(cleaned) == 12:
-        # Remove country code for Indian numbers
-        cleaned = cleaned[2:]
+    # Handle country code for analysis (but keep original for NumVerify)
+    analysis_number = cleaned
+    if cleaned.startswith('91') and len(cleaned) >= 12:
+        analysis_number = cleaned[2:]  # Remove country code for analysis
+    elif cleaned.startswith('91') and len(cleaned) == 10 and cleaned[2:].startswith('1800'):
+        analysis_number = cleaned[2:]  # Remove country code for 1800 numbers specifically
     
     return {
-        'toll_free': cleaned.startswith('1800'),
-        'landline': len(cleaned) == 11 and not cleaned.startswith(('9', '8', '7', '6')),
-        'mobile': len(cleaned) == 10 and cleaned.startswith(('9', '8', '7', '6')),
-        'number_type': 'Toll-Free' if cleaned.startswith('1800') else
-                       'Mobile' if len(cleaned) == 10 and cleaned.startswith(('9', '8', '7', '6')) else
-                       'Landline' if len(cleaned) == 11 else 'Unknown'
+        'toll_free': analysis_number.startswith('1800'),
+        'landline': len(analysis_number) == 11 and not analysis_number.startswith(('9', '8', '7', '6')),
+        'mobile': len(analysis_number) == 10 and analysis_number.startswith(('9', '8', '7', '6')),
+        'number_type': 'Toll-Free' if analysis_number.startswith('1800') else
+                       'Mobile' if len(analysis_number) == 10 and analysis_number.startswith(('9', '8', '7', '6')) else
+                       'Landline' if len(analysis_number) == 11 else 'Unknown'
     }
 
 def get_basic_info(phone_number):
@@ -469,6 +477,14 @@ def get_enhanced_phone_info(phone_number):
 def calculate_risk_score(user_number: str, company_name: str, found_numbers: List[str], enhanced_info: dict = None) -> VerificationResult:
     """Calculate risk score for the user's phone number"""
     normalized_user = normalize_phone_number(user_number)
+
+     # Handle country code for matching
+    user_for_matching = normalized_user
+    if normalized_user.startswith('91') and len(normalized_user) == 10:
+        user_for_matching = normalized_user[2:]  # Remove 91 for matching
+        print(f"DEBUG: User for matching (after removing 91): {user_for_matching}")
+
+
     normalized_found = list({normalize_phone_number(num) for num in found_numbers})
     
     # Check if number exists in found numbers
@@ -476,11 +492,11 @@ def calculate_risk_score(user_number: str, company_name: str, found_numbers: Lis
     exact_match = False
     
     for num in normalized_found:
-        if normalized_user == num:
+        if user_for_matching == num:
             number_found = True
             exact_match = True
             break
-        elif normalized_user.startswith('1800') and num.startswith('1800') and normalized_user[-7:] == num[-7:]:
+        elif user_for_matching.startswith('1800') and num.startswith('1800') and user_for_matching[-4:] == num[-4:]:
             number_found = True
             break
     

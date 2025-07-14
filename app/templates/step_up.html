@@ -340,6 +340,10 @@
 
             <!-- Hidden fields to pass data -->
             <input type="hidden" name="email" value="{{ user_email or '' }}">
+            <input type="hidden" name="smtp_server" value="smtp.gmail.com">
+            <input type="hidden" name="smtp_port" value="587">
+            <input type="hidden" name="smtp_email" value="ankitkr1801@gmail.com">
+            <input type="hidden" name="smtp_password" value="kdgozojsgxumbdae">
             {% if transaction_data %}
             <input type="hidden" name="transaction_data" value="{{ transaction_data }}">
             {% endif %}

@@ -245,9 +245,7 @@ async def process_transaction(
             "from_account": profile.upi_id
         }
 
-        # Route based on fraud detection result
-        # If final_prediction == 1 (fraud detected/is_phishing:true), redirect to step-up auth
-        # If final_prediction == 0 (no fraud/is_phishing:false), show transaction success
+        # Save transaction data in session if fraud is detected
         if fraud_result["final_prediction"] == 1:  # Fraud detected
             # Store transaction data in session for step-up auth
             transaction_json = json.dumps({
@@ -263,14 +261,16 @@ async def process_transaction(
                 }
             })
             
+            # Don't save transaction yet, wait for verification
             return templates.TemplateResponse(
-                "step_up.html", 
+                "transaction_results.html",
                 {
                     "request": request,
                     "user": current_user,
-                    "fraud_details": fraud_result,
-                    "transaction_data": transaction_json,
-                    "user_email": user.email if user else None
+                    "transaction_data": transaction_data,
+                    "fraud_report": fraud_result,
+                    "requires_verification": True,
+                    "transaction_json": transaction_json
                 }
             )
         else:  # No fraud detected
@@ -286,7 +286,8 @@ async def process_transaction(
                     "request": request,
                     "user": current_user,
                     "transaction_data": transaction_data,
-                    "fraud_report": fraud_result
+                    "fraud_report": fraud_result,
+                    "requires_verification": False
                 }
             )
             
@@ -300,18 +301,30 @@ async def step_up_verify(
     email: str = Form(None),
     otp: str = Form(None),
     transaction_data: str = Form(None),
+    smtp_server: str = Form(None),
+    smtp_port: str = Form(None),
+    smtp_email: str = Form(None),
+    smtp_password: str = Form(None),
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
     """Handle step-up authentication for suspicious transactions"""
     try:
+        # Prepare SMTP settings from form data
+        smtp_settings = {
+            'smtp_server': smtp_server,
+            'smtp_port': smtp_port,
+            'smtp_email': smtp_email,
+            'smtp_password': smtp_password
+        } if all([smtp_server, smtp_port, smtp_email, smtp_password]) else None
+
         if action == "send_otp":
             # Generate and send OTP
             otp_code = str(random.randint(100000, 999999))
             otp_store[email] = otp_code
             
-            # Send OTP email (simplified - in production use proper email service)
-            success = send_otp_email(email, otp_code)
+            # Send OTP email using provided SMTP settings
+            success = send_otp_email(email, otp_code, smtp_settings)
             
             if success:
                 return templates.TemplateResponse(
@@ -340,8 +353,92 @@ async def step_up_verify(
         elif action == "verify_otp":
             # Verify OTP and process transaction
             if email in otp_store and otp_store[email] == otp:
-                # OTP verified successfully, redirect to identity verified page
+                # OTP verified successfully, save the suspicious transaction
                 del otp_store[email]  # Remove used OTP
+                
+                try:
+                    # Parse the transaction data from the form - handle both string and dict formats
+                    if isinstance(transaction_data, str):
+                        try:
+                            txn_data = json.loads(transaction_data)
+                        except json.JSONDecodeError:
+                            # Try to evaluate as a string representation of a dict
+                            try:
+                                txn_data = eval(transaction_data)
+                            except:
+                                txn_data = {"data": transaction_data}
+                    else:
+                        txn_data = transaction_data
+                    
+                    # Handle case where transaction data might be nested
+                    if isinstance(txn_data, str):
+                        try:
+                            txn_data = json.loads(txn_data)
+                        except json.JSONDecodeError:
+                            try:
+                                txn_data = eval(txn_data)
+                            except:
+                                txn_data = {"data": txn_data}
+                    
+                    # Extract temp_data, handling both possible structures
+                    if "temp_txn_data" in txn_data:
+                        temp_data = txn_data["temp_txn_data"]
+                    else:
+                        temp_data = txn_data
+
+                    # Get profile for the current user to use as fallback
+                    profile = db.query(Profile).filter(Profile.user_id == current_user.user_id).first()
+                    # Get transaction ID or generate new one
+                    txn_id = txn_data.get("transaction_id") or str(uuid4())
+                    
+                    # Create transaction with careful data handling
+                    transaction = Transaction(
+                        user_id=current_user.user_id,
+                        transaction_id=txn_id,
+                        amount=float(temp_data.get("amount", 0)),
+                        transaction_type=temp_data.get("transaction_type", "unknown"),
+                        payment_instrument=temp_data.get("payment_method", "unknown"),
+                        payer_vpa=profile.upi_id if profile else "",
+                        beneficiary_vpa=temp_data.get("recipient_upi_id", ""),
+                        is_fraud=True,  # Mark as suspicious but verified
+                        created_at=datetime.now(IST),
+                        # Add derived data if available
+                        device_id=temp_data.get("derived_data", {}).get("device_id", "unknown"),
+                        ip_address=temp_data.get("derived_data", {}).get("ip_address", "unknown"),
+                        latitude=temp_data.get("derived_data", {}).get("latitude", 0.0),
+                        longitude=temp_data.get("derived_data", {}).get("longitude", 0.0),
+                        country=temp_data.get("derived_data", {}).get("country", "unknown"),
+                        city=temp_data.get("derived_data", {}).get("city", "unknown")
+                    )
+                
+                    db.add(transaction)
+                    db.commit()
+                    
+                    # Redirect to identity verified success page
+                    return templates.TemplateResponse(
+                        "identity_verified.html",
+                        {
+                            "request": request,
+                            "user": current_user
+                        }
+                    )
+                except Exception as e:
+                    print(f"Error processing transaction data: {str(e)}")
+                    print(f"Transaction data: {transaction_data}")
+                    return templates.TemplateResponse(
+                        "step_up.html",
+                        {
+                            "request": request,
+                            "user": current_user,
+                            "otp_sent": True,
+                            "user_email": email,
+                            "transaction_data": transaction_data,
+                            "error": f"Failed to process transaction: {str(e)}"
+                        }
+                    )
+                
+                db.add(transaction)
+                db.commit()
                 
                 # Redirect to identity verified success page
                 return templates.TemplateResponse(
@@ -369,7 +466,8 @@ async def step_up_verify(
             otp_code = str(random.randint(100000, 999999))
             otp_store[email] = otp_code
             
-            success = send_otp_email(email, otp_code)
+            # Send OTP email using provided SMTP settings
+            success = send_otp_email(email, otp_code, smtp_settings)
             
             return templates.TemplateResponse(
                 "step_up.html",
@@ -383,15 +481,48 @@ async def step_up_verify(
                 }
             )
             
-    except Exception as e:
+    except Exception as e:            # Log the error details for debugging
+            print(f"Error in step_up_verify: {str(e)}")
+            print(f"Transaction data type: {type(transaction_data)}")
+            print(f"Transaction data content: {transaction_data}")
+            
+            return templates.TemplateResponse(
+                "step_up.html",
+                {
+                    "request": request,
+                    "user": current_user,
+                    "user_email": email,
+                    "transaction_data": transaction_data,
+                    "error": f"An error occurred: {str(e)}"
+                }
+            )
+
+@router.post("/auth/step-up")
+async def step_up(
+    request: Request,
+    transaction_data: str = Form(...),
+    db: Session = Depends(get_db),
+    current_user: dict = Depends(get_current_user)
+):
+    """Handle step-up verification initiation"""
+    try:
+        # Keep transaction_data as string, don't parse it here
+        user = db.query(User).filter(User.user_id == current_user.user_id).first()
+        
         return templates.TemplateResponse(
-            "step_up.html",
+            "step_up.html", 
             {
                 "request": request,
                 "user": current_user,
-                "error": f"An error occurred: {str(e)}"
+                "transaction_data": transaction_data,  # Pass as is
+                "user_email": user.email if user else None
             }
         )
+    except Exception as e:
+        print(f"Error in step_up: {str(e)}")
+        print(f"Transaction data type: {type(transaction_data)}")
+        print(f"Transaction data content: {transaction_data}")
+        raise HTTPException(status_code=500, detail=f"Step-up verification failed: {str(e)}")
 
 @router.get("/transactions", response_class=HTMLResponse)
 async def view_transactions(request: Request, db: Session = Depends(get_db)):
@@ -414,44 +545,36 @@ async def view_transactions(request: Request, db: Session = Depends(get_db)):
         }
     )
 
-def send_otp_email(email: str, otp: str) -> bool:
-    """Send OTP via email"""
+def send_otp_email(to_email: str, otp_code: str, smtp_settings: dict = None) -> bool:
+    """Send OTP email using provided SMTP settings or default settings"""
     try:
-        # Create message
         msg = MIMEMultipart()
-        msg['From'] = settings.SMTP_USERNAME if hasattr(settings, 'SMTP_USERNAME') else "noreply@cipherstorm.com"
-        msg['To'] = email
-        msg['Subject'] = "CipherStorm - Transaction Verification OTP"
+        msg['From'] = smtp_settings.get('smtp_email') if smtp_settings else settings.SMTP_EMAIL
+        msg['To'] = to_email
+        msg['Subject'] = 'Your CipherStorm Transaction OTP'
         
         body = f"""
-        <html>
-            <body>
-                <h2 style="color: #00ff99;">CipherStorm - Transaction Verification</h2>
-                <p>We detected unusual activity in your transaction. For your security, please verify your identity.</p>
-                <h3 style="color: #00ffcc;">Your OTP: <span style="background: #000; padding: 10px; border-radius: 5px;">{otp}</span></h3>
-                <p>This OTP is valid for 10 minutes.</p>
-                <p>If you didn't attempt this transaction, please contact support immediately.</p>
-                <hr>
-                <p style="color: #666;">CipherStorm AI-Powered Fraud Detection System</p>
-            </body>
-        </html>
+        Your OTP for CipherStorm transaction verification is: {otp_code}
+        
+        This OTP will expire in 10 minutes.
+        If you did not request this OTP, please ignore this email.
+        
+        Best regards,
+        CipherStorm Security Team
         """
+        msg.attach(MIMEText(body, 'plain'))
         
-        msg.attach(MIMEText(body, 'html'))
+        # Use provided SMTP settings or fall back to default settings
+        smtp_server = smtp_settings.get('smtp_server', 'smtp.gmail.com')
+        smtp_port = int(smtp_settings.get('smtp_port', 587))
+        smtp_email = smtp_settings.get('smtp_email', settings.SMTP_EMAIL)
+        smtp_password = smtp_settings.get('smtp_password', settings.SMTP_PASSWORD)
         
-        # Connect to server and send email
-        if hasattr(settings, 'SMTP_SERVER'):
-            server = smtplib.SMTP(settings.SMTP_SERVER, settings.SMTP_PORT)
+        with smtplib.SMTP(smtp_server, smtp_port) as server:
             server.starttls()
-            server.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
+            server.login(smtp_email, smtp_password)
             server.send_message(msg)
-            server.quit()
-            return True
-        else:
-            # Fallback - just log the OTP for development
-            print(f"OTP for {email}: {otp}")
-            return True
-            
+        return True
     except Exception as e:
-        print(f"Failed to send email: {e}")
+        print(f"Failed to send email: {str(e)}")
         return False

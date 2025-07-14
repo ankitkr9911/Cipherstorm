@@ -290,3 +290,8 @@ async def scan_url_form(
             }
         )
 
+@router.get("/", response_class=HTMLResponse)
+async def get_url_input_page(request: Request, current_user: dict = Depends(get_current_user_util)):
+    """Render the URL input page"""
+    return templates.TemplateResponse("url_input.html", {"request": request, "user": current_user})
+
